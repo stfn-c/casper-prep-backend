@@ -4,10 +4,18 @@ Handles eye contact detection using dlib facial landmarks.
 """
 
 import cv2
-import dlib
 import numpy as np
 from pathlib import Path
 from typing import List, Tuple
+
+# Try to import dlib - optional dependency
+try:
+    import dlib
+    DLIB_AVAILABLE = True
+except ImportError:
+    dlib = None
+    DLIB_AVAILABLE = False
+    print("[Warning] dlib not available - eye contact analysis disabled")
 
 # Lazy-loaded dlib models
 _face_detector = None
@@ -54,6 +62,14 @@ def analyze_eye_contact(video_path: Path, sample_rate: int = 5) -> dict:
             "timeline": [{"time": float, "hasContact": bool}, ...]
         }
     """
+    if not DLIB_AVAILABLE:
+        return {
+            "eye_contact_percentage": None,
+            "issues": [],
+            "timeline": [],
+            "error": "dlib not available - eye contact analysis disabled"
+        }
+    
     face_detector = get_face_detector()
     landmark_predictor = get_landmark_predictor()
 
