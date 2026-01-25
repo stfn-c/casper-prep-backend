@@ -10,6 +10,7 @@ from app.models import (
 from app.services import database as db
 from app.services.analyzer import analyze_attempt as run_analysis
 from app.services.analyzer import analyze_full_video_attempt as run_full_video_analysis
+from app.services.analyzer import analyze_mock_exam as run_mock_exam_analysis
 
 
 @asynccontextmanager
@@ -291,6 +292,102 @@ async def analyze_full_video_sync(attempt_id: int, full_video_key: str):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/analyze/mock-exam/{mock_exam_attempt_id}", response_model=AnalyzeResponse)
+async def analyze_mock_exam(mock_exam_attempt_id: int, background_tasks: BackgroundTasks):
+    """
+    Aggregate feedback for a completed mock exam.
+    Call this after all scenario analyses are complete.
+    """
+    try:
+        mock_attempt = await db.get_mock_exam_attempt(mock_exam_attempt_id)
+        if not mock_attempt:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Mock exam attempt {mock_exam_attempt_id} not found"
+            )
+
+        if mock_attempt["feedback_status"] == "processing":
+            return AnalyzeResponse(
+                attempt_id=mock_exam_attempt_id,
+                status=AnalysisStatus.PROCESSING,
+                message=f"Mock exam aggregation already in progress"
+            )
+
+        if mock_attempt["feedback_status"] == "completed":
+            return AnalyzeResponse(
+                attempt_id=mock_exam_attempt_id,
+                status=AnalysisStatus.COMPLETED,
+                message=f"Mock exam feedback already generated"
+            )
+
+        background_tasks.add_task(run_mock_exam_analysis_task, mock_exam_attempt_id)
+
+        return AnalyzeResponse(
+            attempt_id=mock_exam_attempt_id,
+            status=AnalysisStatus.PROCESSING,
+            message=f"Mock exam aggregation started"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to start mock exam aggregation: {str(e)}"
+        )
+
+
+async def run_mock_exam_analysis_task(mock_exam_attempt_id: int):
+    try:
+        print(f"[Background] Starting mock exam aggregation for {mock_exam_attempt_id}")
+        result = await run_mock_exam_analysis(mock_exam_attempt_id)
+        print(f"[Background] Mock exam aggregation complete: {result}")
+    except Exception as e:
+        print(f"[Background] Mock exam aggregation failed for {mock_exam_attempt_id}: {e}")
+
+
+@app.get("/analyze/mock-exam/{mock_exam_attempt_id}/status")
+async def get_mock_exam_status(mock_exam_attempt_id: int):
+    """Check status of mock exam analysis and whether aggregation can be triggered."""
+    try:
+        mock_attempt = await db.get_mock_exam_attempt(mock_exam_attempt_id)
+        if not mock_attempt:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Mock exam attempt {mock_exam_attempt_id} not found"
+            )
+
+        scenario_attempts = await db.get_scenario_attempts_for_mock(mock_exam_attempt_id)
+        
+        total = len(scenario_attempts)
+        completed = sum(1 for sa in scenario_attempts if sa["feedback_status"] == "completed")
+        failed = sum(1 for sa in scenario_attempts if sa["feedback_status"] == "failed")
+        
+        ready_for_aggregation = completed == total and total > 0
+
+        return {
+            "mock_exam_attempt_id": mock_exam_attempt_id,
+            "mock_feedback_status": mock_attempt["feedback_status"],
+            "scenarios": {
+                "total": total,
+                "completed": completed,
+                "failed": failed,
+                "pending": total - completed - failed
+            },
+            "ready_for_aggregation": ready_for_aggregation,
+            "overall_quartile": mock_attempt.get("overall_quartile"),
+            "overall_summary": mock_attempt.get("overall_summary")
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get mock exam status: {str(e)}"
+        )
 
 
 if __name__ == "__main__":

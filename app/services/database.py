@@ -45,8 +45,10 @@ async def get_scenario_attempt(attempt_id: int) -> Optional[Dict[str, Any]]:
         SELECT
             sa.id, sa.user_id, sa.scenario_id, sa.session_id,
             sa.status, sa.feedback_status,
+            sa.overall_quartile, sa.overall_scores, sa.overall_summary,
+            sa.overall_strengths, sa.overall_improvements,
             s.title as scenario_title, s.type as scenario_type,
-            s.content as scenario_content, s.questions
+            s.content as scenario_content, s.description as scenario_description, s.questions
         FROM scenario_attempts sa
         JOIN scenarios s ON s.id = sa.scenario_id
         WHERE sa.id = $1
@@ -80,13 +82,13 @@ async def get_question_responses(attempt_id: int) -> List[Dict[str, Any]]:
 
 async def update_question_response_analysis(
     response_id: int,
-    video_analysis: Dict[str, Any],
+    video_analysis: Optional[Dict[str, Any]],
     score: float,
     strengths: List[str],
     improvements: List[str],
+    optimal_response: Optional[str] = None,
     feedback_status: str = "completed"
 ):
-    """Update a question response with analysis results."""
     pool = await get_pool()
     await pool.execute(
         """
@@ -96,14 +98,16 @@ async def update_question_response_analysis(
             score = $3,
             strengths = $4,
             improvements = $5,
-            feedback_status = $6
+            optimal_response = $6,
+            feedback_status = $7
         WHERE id = $1
         """,
         response_id,
-        json.dumps(video_analysis),
+        json.dumps(video_analysis) if video_analysis else None,
         score,
         strengths,
         improvements,
+        optimal_response,
         feedback_status
     )
 
@@ -197,3 +201,82 @@ async def reset_attempt_for_retry(attempt_id: int):
                 "UPDATE question_responses SET feedback_status = 'pending' WHERE attempt_id = $1",
                 attempt_id
             )
+
+
+async def get_mock_exam_attempt(mock_exam_attempt_id: int) -> Optional[Dict[str, Any]]:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        """
+        SELECT
+            mea.id, mea.user_id, mea.mock_exam_id, mea.status,
+            mea.feedback_status, mea.overall_quartile, mea.overall_scores,
+            mea.overall_strengths, mea.overall_improvements, mea.overall_summary,
+            me.name as exam_name
+        FROM mock_exam_attempts mea
+        JOIN mock_exams me ON me.id = mea.mock_exam_id
+        WHERE mea.id = $1
+        """,
+        mock_exam_attempt_id
+    )
+    return dict(row) if row else None
+
+
+async def get_scenario_attempts_for_mock(mock_exam_attempt_id: int) -> List[Dict[str, Any]]:
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT
+            sa.id, sa.scenario_id, sa.feedback_status,
+            sa.overall_quartile, sa.overall_scores,
+            sa.overall_strengths, sa.overall_improvements, sa.overall_summary,
+            s.title as scenario_title
+        FROM scenario_attempts sa
+        JOIN scenarios s ON s.id = sa.scenario_id
+        WHERE sa.mock_exam_attempt_id = $1
+        ORDER BY sa.id
+        """,
+        mock_exam_attempt_id
+    )
+    return [dict(row) for row in rows]
+
+
+async def update_mock_exam_attempt_feedback(
+    mock_exam_attempt_id: int,
+    overall_quartile: int,
+    overall_scores: Dict[str, float],
+    overall_strengths: List[str],
+    overall_improvements: List[str],
+    overall_summary: str,
+    feedback_status: str = "completed"
+):
+    pool = await get_pool()
+    await pool.execute(
+        """
+        UPDATE mock_exam_attempts
+        SET
+            feedback_status = $2,
+            overall_quartile = $3,
+            overall_scores = $4::jsonb,
+            overall_strengths = $5,
+            overall_improvements = $6,
+            overall_summary = $7,
+            feedback_generated_at = NOW()
+        WHERE id = $1
+        """,
+        mock_exam_attempt_id,
+        feedback_status,
+        overall_quartile,
+        json.dumps(overall_scores),
+        overall_strengths,
+        overall_improvements,
+        overall_summary
+    )
+
+
+async def update_mock_exam_attempt_status(mock_exam_attempt_id: int, status: str):
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE mock_exam_attempts SET feedback_status = $2 WHERE id = $1",
+        mock_exam_attempt_id,
+        status
+    )

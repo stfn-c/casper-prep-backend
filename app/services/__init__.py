@@ -3,7 +3,7 @@ Services package for CasperPrep backend.
 """
 
 from .audio import analyze_audio, extract_audio, transcribe, detect_filler_words
-from .feedback import generate_question_feedback, generate_scenario_feedback
+from .feedback import generate_text_feedback, generate_video_feedback, generate_scenario_feedback
 from .r2 import r2_service
 from .analyzer import analyze_attempt
 
@@ -18,7 +18,8 @@ __all__ = [
     "extract_audio",
     "transcribe",
     "detect_filler_words",
-    "generate_question_feedback",
+    "generate_text_feedback",
+    "generate_video_feedback",
     "generate_scenario_feedback",
     "r2_service",
     "analyze_attempt",

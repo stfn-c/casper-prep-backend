@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from app.services.r2 import r2_service
 from app.services.audio import analyze_audio
 from app.services.video import analyze_eye_contact
-from app.services.feedback import generate_question_feedback, generate_scenario_feedback
+from app.services.feedback import generate_text_feedback, generate_video_feedback, generate_scenario_feedback, generate_mock_exam_feedback
 from app.services.segmenter import process_full_video
 from app.services import database as db
 
@@ -86,20 +86,22 @@ async def analyze_attempt(attempt_id: int) -> Dict[str, Any]:
         if not responses:
             raise ValueError(f"No responses found for attempt {attempt_id}")
 
-        # Analyze each response
+        scenario_context = attempt.get("scenario_description") or attempt.get("scenario_content")
+        
         question_feedbacks = []
         for response in responses:
             if response["type"] == "video" and response["video_url"]:
                 feedback = await analyze_video_response(
                     response=response,
                     user_id=str(attempt["user_id"]),
-                    attempt_id=attempt_id
+                    attempt_id=attempt_id,
+                    scenario_context=scenario_context
                 )
                 question_feedbacks.append(feedback)
             elif response["type"] == "text" and response["text_content"]:
                 feedback = await analyze_text_response(
                     response=response,
-                    scenario_content=attempt["scenario_content"]
+                    scenario_context=scenario_context
                 )
                 question_feedbacks.append(feedback)
 
@@ -119,6 +121,7 @@ async def analyze_attempt(attempt_id: int) -> Dict[str, Any]:
         )
 
         # Save scenario feedback
+        print(f"[Analyzer] Saving scenario feedback: quartile={overall_quartile}, scores={overall_scores}")
         await db.update_scenario_attempt_feedback(
             attempt_id=attempt_id,
             overall_quartile=overall_quartile,
@@ -128,6 +131,7 @@ async def analyze_attempt(attempt_id: int) -> Dict[str, Any]:
             overall_summary=scenario_feedback["summary"],
             feedback_status="completed"
         )
+        print(f"[Analyzer] Scenario feedback saved successfully")
 
         return {
             "attempt_id": attempt_id,
@@ -148,7 +152,8 @@ async def analyze_video_response(
     user_id: str,
     attempt_id: int,
     segment_start_time: Optional[float] = None,
-    segment_end_time: Optional[float] = None
+    segment_end_time: Optional[float] = None,
+    scenario_context: Optional[str] = None
 ) -> Dict[str, Any]:
     """Analyze a single video response."""
     response_id = response["id"]
@@ -190,14 +195,14 @@ async def analyze_video_response(
         )
         print(f"[Analyzer] Eye contact: {eye_result['eye_contact_percentage']}%")
 
-        # Generate LLM feedback
         print(f"[Analyzer] Generating LLM feedback...")
-        llm_feedback = await generate_question_feedback(
+        llm_feedback = await generate_video_feedback(
             question_text=question_text,
             transcript=audio_result["transcript"],
-            filler_word_count=len(audio_result["filler_words"]),
             eye_contact_pct=eye_result["eye_contact_percentage"],
-            words_per_minute=audio_result["words_per_minute"]
+            words_per_minute=audio_result["words_per_minute"],
+            filler_word_count=len(audio_result["filler_words"]),
+            scenario_context=scenario_context
         )
         print(f"[Analyzer] LLM feedback generated. Score: {llm_feedback['score']}")
 
@@ -216,13 +221,13 @@ async def analyze_video_response(
             "segmentEndTime": segment_end_time
         }
 
-        # Save to database
         await db.update_question_response_analysis(
             response_id=response_id,
             video_analysis=video_analysis,
             score=llm_feedback["score"],
             strengths=llm_feedback["strengths"],
             improvements=llm_feedback["improvements"],
+            optimal_response=llm_feedback.get("optimal_response"),
             feedback_status="completed"
         )
 
@@ -232,7 +237,8 @@ async def analyze_video_response(
             "competency_scores": llm_feedback.get("competency_scores", {}),
             "strengths": llm_feedback["strengths"],
             "improvements": llm_feedback["improvements"],
-            "feedback_text": llm_feedback["feedback_text"]
+            "feedback_text": llm_feedback["feedback_text"],
+            "optimal_response": llm_feedback.get("optimal_response")
         }
 
     except Exception as e:
@@ -248,33 +254,29 @@ async def analyze_video_response(
 
 async def analyze_text_response(
     response: Dict[str, Any],
-    scenario_content: str
+    scenario_context: str
 ) -> Dict[str, Any]:
     """Analyze a text response (no video analysis, just LLM feedback)."""
     response_id = response["id"]
     question_text = response["question_text"]
     text_content = response["text_content"]
 
-    # Mark as processing
     await db.update_response_feedback_status(response_id, "processing")
 
     try:
-        # Generate LLM feedback for text response
-        llm_feedback = await generate_question_feedback(
+        llm_feedback = await generate_text_feedback(
             question_text=question_text,
-            transcript=text_content,  # Use text content as "transcript"
-            filler_word_count=0,  # N/A for text
-            eye_contact_pct=100.0,  # N/A for text
-            words_per_minute=0.0  # N/A for text
+            response_text=text_content,
+            scenario_context=scenario_context
         )
 
-        # Save to database (no video_analysis for text)
         await db.update_question_response_analysis(
             response_id=response_id,
             video_analysis=None,
             score=llm_feedback["score"],
             strengths=llm_feedback["strengths"],
             improvements=llm_feedback["improvements"],
+            optimal_response=llm_feedback.get("optimal_response"),
             feedback_status="completed"
         )
 
@@ -284,7 +286,8 @@ async def analyze_text_response(
             "competency_scores": llm_feedback.get("competency_scores", {}),
             "strengths": llm_feedback["strengths"],
             "improvements": llm_feedback["improvements"],
-            "feedback_text": llm_feedback["feedback_text"]
+            "feedback_text": llm_feedback["feedback_text"],
+            "optimal_response": llm_feedback.get("optimal_response")
         }
 
     except Exception as e:
@@ -355,8 +358,8 @@ async def analyze_full_video_attempt(
                 video_url=segment_info["video_key"]  # None if not answered
             )
 
-        # Analyze each segment using existing pipeline
         print(f"[FullVideoAnalyzer] Analyzing individual segments")
+        scenario_context = attempt.get("scenario_description") or attempt.get("scenario_content")
         question_feedbacks = []
 
         for segment_info in segmentation_result["segments"]:
@@ -364,12 +367,10 @@ async def analyze_full_video_attempt(
             response = responses[question_idx]
 
             if not segment_info["answered"]:
-                # Mark as failed/skipped
                 await db.update_response_feedback_status(response["id"], "failed")
                 print(f"[FullVideoAnalyzer] Question {question_idx + 1} was not answered")
                 continue
 
-            # Analyze this segment (pass timing info for display on frontend)
             feedback = await analyze_video_response(
                 response={
                     **response,
@@ -378,7 +379,8 @@ async def analyze_full_video_attempt(
                 user_id=str(attempt["user_id"]),
                 attempt_id=attempt_id,
                 segment_start_time=segment_info.get("start_time"),
-                segment_end_time=segment_info.get("end_time")
+                segment_end_time=segment_info.get("end_time"),
+                scenario_context=scenario_context
             )
             question_feedbacks.append(feedback)
 
@@ -413,7 +415,6 @@ async def analyze_full_video_attempt(
                 "overall_quartile": overall_quartile
             }
         else:
-            # No questions were answered
             await db.update_attempt_feedback_status(attempt_id, "failed")
             return {
                 "attempt_id": attempt_id,
@@ -422,6 +423,85 @@ async def analyze_full_video_attempt(
             }
 
     except Exception as e:
-        # Mark as failed
         await db.update_attempt_feedback_status(attempt_id, "failed")
+        raise e
+
+
+async def analyze_mock_exam(mock_exam_attempt_id: int) -> Dict[str, Any]:
+    """
+    Aggregate feedback for a completed mock exam.
+    
+    This should be called after all scenario attempts have been analyzed.
+    It aggregates scores and generates overall mock exam feedback.
+    """
+    await db.update_mock_exam_attempt_status(mock_exam_attempt_id, "processing")
+
+    try:
+        mock_attempt = await db.get_mock_exam_attempt(mock_exam_attempt_id)
+        if not mock_attempt:
+            raise ValueError(f"Mock exam attempt {mock_exam_attempt_id} not found")
+
+        scenario_attempts = await db.get_scenario_attempts_for_mock(mock_exam_attempt_id)
+        if not scenario_attempts:
+            raise ValueError(f"No scenario attempts found for mock exam {mock_exam_attempt_id}")
+
+        all_completed = all(sa["feedback_status"] == "completed" for sa in scenario_attempts)
+        if not all_completed:
+            pending = [sa["scenario_title"] for sa in scenario_attempts if sa["feedback_status"] != "completed"]
+            raise ValueError(f"Not all scenarios analyzed yet. Pending: {pending}")
+
+        scenario_feedbacks = []
+        all_scores = []
+        
+        for sa in scenario_attempts:
+            scores = sa.get("overall_scores") or {}
+            quartile = sa.get("overall_quartile") or 0
+            
+            scenario_feedbacks.append({
+                "scenario_title": sa["scenario_title"],
+                "quartile": quartile,
+                "scores": scores,
+                "strengths": sa.get("overall_strengths") or [],
+                "improvements": sa.get("overall_improvements") or [],
+                "summary": sa.get("overall_summary") or ""
+            })
+            
+            if scores:
+                all_scores.append(scores)
+
+        overall_scores = {}
+        if all_scores:
+            competencies = ["empathy", "communication", "ethical_reasoning", "professionalism"]
+            for c in competencies:
+                values = [s.get(c, 0) for s in all_scores if c in s]
+                overall_scores[c] = round(sum(values) / len(values), 1) if values else 5.0
+
+        avg_score = sum(overall_scores.values()) / len(overall_scores) if overall_scores else 5.0
+        overall_quartile = calculate_quartile(avg_score)
+
+        mock_feedback = await generate_mock_exam_feedback(
+            exam_name=mock_attempt["exam_name"],
+            scenario_feedbacks=scenario_feedbacks
+        )
+
+        await db.update_mock_exam_attempt_feedback(
+            mock_exam_attempt_id=mock_exam_attempt_id,
+            overall_quartile=overall_quartile,
+            overall_scores=overall_scores,
+            overall_strengths=mock_feedback["strengths"],
+            overall_improvements=mock_feedback["improvements"],
+            overall_summary=mock_feedback["summary"],
+            feedback_status="completed"
+        )
+
+        return {
+            "mock_exam_attempt_id": mock_exam_attempt_id,
+            "status": "completed",
+            "scenarios_analyzed": len(scenario_attempts),
+            "overall_quartile": overall_quartile,
+            "overall_scores": overall_scores
+        }
+
+    except Exception as e:
+        await db.update_mock_exam_attempt_status(mock_exam_attempt_id, "failed")
         raise e
