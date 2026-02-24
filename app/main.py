@@ -1,5 +1,8 @@
+import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from typing import Dict
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from app.models import (
     AnalyzeResponse,
@@ -29,6 +32,20 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# In-process task registry used for cancellation endpoints.
+_attempt_tasks: Dict[int, asyncio.Task] = {}
+_mock_tasks: Dict[int, asyncio.Task] = {}
+
+
+def _register_task(task_map: Dict[int, asyncio.Task], key: int, task: asyncio.Task) -> None:
+    task_map[key] = task
+
+    def _cleanup(done_task: asyncio.Task) -> None:
+        if task_map.get(key) is done_task:
+            task_map.pop(key, None)
+
+    task.add_done_callback(_cleanup)
+
 # CORS middleware - configure as needed
 app.add_middleware(
     CORSMiddleware,
@@ -49,7 +66,7 @@ async def health_check():
 
 
 @app.post("/analyze/attempt/{attempt_id}", response_model=AnalyzeResponse)
-async def analyze_attempt(attempt_id: int, background_tasks: BackgroundTasks):
+async def analyze_attempt(attempt_id: int):
     """
     Trigger analysis for a scenario attempt.
 
@@ -76,6 +93,14 @@ async def analyze_attempt(attempt_id: int, background_tasks: BackgroundTasks):
                 detail=f"Attempt {attempt_id} not found"
             )
 
+        active_task = _attempt_tasks.get(attempt_id)
+        if active_task and not active_task.done():
+            return AnalyzeResponse(
+                attempt_id=attempt_id,
+                status=AnalysisStatus.PROCESSING,
+                message=f"Analysis already in progress for attempt {attempt_id}"
+            )
+
         # Check if already processing
         if attempt["feedback_status"] == "processing":
             return AnalyzeResponse(
@@ -85,7 +110,8 @@ async def analyze_attempt(attempt_id: int, background_tasks: BackgroundTasks):
             )
 
         # Run analysis in background
-        background_tasks.add_task(run_analysis_task, attempt_id)
+        task = asyncio.create_task(run_analysis_task(attempt_id))
+        _register_task(_attempt_tasks, attempt_id, task)
 
         return AnalyzeResponse(
             attempt_id=attempt_id,
@@ -108,6 +134,9 @@ async def run_analysis_task(attempt_id: int):
         print(f"[Background] Starting analysis for attempt {attempt_id}")
         result = await run_analysis(attempt_id)
         print(f"[Background] Analysis complete: {result}")
+    except asyncio.CancelledError:
+        print(f"[Background] Analysis cancelled for attempt {attempt_id}")
+        raise
     except Exception as e:
         print(f"[Background] Analysis failed for attempt {attempt_id}: {e}")
 
@@ -187,12 +216,17 @@ async def analyze_attempt_sync(attempt_id: int):
 
 
 @app.post("/analyze/retry/{attempt_id}")
-async def retry_analysis(attempt_id: int, background_tasks: BackgroundTasks):
+async def retry_analysis(attempt_id: int):
     """
     Force retry analysis for an attempt (resets status and re-runs).
     Returns immediately, all work happens in background.
     """
-    background_tasks.add_task(run_retry_task, attempt_id)
+    active_task = _attempt_tasks.get(attempt_id)
+    if active_task and not active_task.done():
+        active_task.cancel()
+
+    task = asyncio.create_task(run_retry_task(attempt_id))
+    _register_task(_attempt_tasks, attempt_id, task)
     return {"message": f"Retry queued for attempt {attempt_id}", "attempt_id": attempt_id}
 
 
@@ -204,6 +238,9 @@ async def run_retry_task(attempt_id: int):
         print(f"[Background] Starting analysis for attempt {attempt_id}")
         result = await run_analysis(attempt_id)
         print(f"[Background] Analysis complete: {result}")
+    except asyncio.CancelledError:
+        print(f"[Background] Retry cancelled for attempt {attempt_id}")
+        raise
     except Exception as e:
         print(f"[Background] Retry failed for attempt {attempt_id}: {e}")
 
@@ -211,8 +248,7 @@ async def run_retry_task(attempt_id: int):
 @app.post("/analyze/full-video/{attempt_id}", response_model=AnalyzeResponse)
 async def analyze_full_video(
     attempt_id: int,
-    full_video_key: str,
-    background_tasks: BackgroundTasks
+    full_video_key: str
 ):
     """
     Trigger analysis for a full video (new flow).
@@ -243,6 +279,14 @@ async def analyze_full_video(
                 detail=f"Attempt {attempt_id} not found"
             )
 
+        active_task = _attempt_tasks.get(attempt_id)
+        if active_task and not active_task.done():
+            return AnalyzeResponse(
+                attempt_id=attempt_id,
+                status=AnalysisStatus.PROCESSING,
+                message=f"Analysis already in progress for attempt {attempt_id}"
+            )
+
         # Check if already processing
         if attempt["feedback_status"] == "processing":
             return AnalyzeResponse(
@@ -252,7 +296,8 @@ async def analyze_full_video(
             )
 
         # Run full video analysis in background
-        background_tasks.add_task(run_full_video_analysis_task, attempt_id, full_video_key)
+        task = asyncio.create_task(run_full_video_analysis_task(attempt_id, full_video_key))
+        _register_task(_attempt_tasks, attempt_id, task)
 
         return AnalyzeResponse(
             attempt_id=attempt_id,
@@ -275,6 +320,9 @@ async def run_full_video_analysis_task(attempt_id: int, full_video_key: str):
         print(f"[Background] Starting full video analysis for attempt {attempt_id}")
         result = await run_full_video_analysis(attempt_id, full_video_key)
         print(f"[Background] Full video analysis complete: {result}")
+    except asyncio.CancelledError:
+        print(f"[Background] Full video analysis cancelled for attempt {attempt_id}")
+        raise
     except Exception as e:
         print(f"[Background] Full video analysis failed for attempt {attempt_id}: {e}")
 
@@ -295,7 +343,7 @@ async def analyze_full_video_sync(attempt_id: int, full_video_key: str):
 
 
 @app.post("/analyze/mock-exam/{mock_exam_attempt_id}", response_model=AnalyzeResponse)
-async def analyze_mock_exam(mock_exam_attempt_id: int, background_tasks: BackgroundTasks):
+async def analyze_mock_exam(mock_exam_attempt_id: int):
     """
     Aggregate feedback for a completed mock exam.
     Call this after all scenario analyses are complete.
@@ -306,6 +354,14 @@ async def analyze_mock_exam(mock_exam_attempt_id: int, background_tasks: Backgro
             raise HTTPException(
                 status_code=404,
                 detail=f"Mock exam attempt {mock_exam_attempt_id} not found"
+            )
+
+        active_task = _mock_tasks.get(mock_exam_attempt_id)
+        if active_task and not active_task.done():
+            return AnalyzeResponse(
+                attempt_id=mock_exam_attempt_id,
+                status=AnalysisStatus.PROCESSING,
+                message=f"Mock exam aggregation already in progress"
             )
 
         if mock_attempt["feedback_status"] == "processing":
@@ -322,7 +378,8 @@ async def analyze_mock_exam(mock_exam_attempt_id: int, background_tasks: Backgro
                 message=f"Mock exam feedback already generated"
             )
 
-        background_tasks.add_task(run_mock_exam_analysis_task, mock_exam_attempt_id)
+        task = asyncio.create_task(run_mock_exam_analysis_task(mock_exam_attempt_id))
+        _register_task(_mock_tasks, mock_exam_attempt_id, task)
 
         return AnalyzeResponse(
             attempt_id=mock_exam_attempt_id,
@@ -344,8 +401,61 @@ async def run_mock_exam_analysis_task(mock_exam_attempt_id: int):
         print(f"[Background] Starting mock exam aggregation for {mock_exam_attempt_id}")
         result = await run_mock_exam_analysis(mock_exam_attempt_id)
         print(f"[Background] Mock exam aggregation complete: {result}")
+    except asyncio.CancelledError:
+        print(f"[Background] Mock exam aggregation cancelled for {mock_exam_attempt_id}")
+        raise
     except Exception as e:
         print(f"[Background] Mock exam aggregation failed for {mock_exam_attempt_id}: {e}")
+
+
+@app.post("/analyze/cancel/attempt/{attempt_id}")
+async def cancel_attempt_analysis(attempt_id: int):
+    task = _attempt_tasks.get(attempt_id)
+    was_running = bool(task and not task.done())
+
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"[Background] Attempt cancel cleanup error for {attempt_id}: {e}")
+
+    attempt = await db.get_scenario_attempt(attempt_id)
+    if attempt:
+        await db.update_attempt_feedback_status(attempt_id, "failed")
+
+    return {
+        "attempt_id": attempt_id,
+        "cancelled": was_running,
+        "message": "Cancellation requested" if was_running else "No active job found"
+    }
+
+
+@app.post("/analyze/cancel/mock-exam/{mock_exam_attempt_id}")
+async def cancel_mock_exam_analysis(mock_exam_attempt_id: int):
+    task = _mock_tasks.get(mock_exam_attempt_id)
+    was_running = bool(task and not task.done())
+
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"[Background] Mock cancel cleanup error for {mock_exam_attempt_id}: {e}")
+
+    mock_attempt = await db.get_mock_exam_attempt(mock_exam_attempt_id)
+    if mock_attempt:
+        await db.update_mock_exam_attempt_status(mock_exam_attempt_id, "failed")
+
+    return {
+        "mock_exam_attempt_id": mock_exam_attempt_id,
+        "cancelled": was_running,
+        "message": "Cancellation requested" if was_running else "No active job found"
+    }
 
 
 @app.get("/analyze/mock-exam/{mock_exam_attempt_id}/status")
