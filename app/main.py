@@ -46,6 +46,50 @@ def _register_task(task_map: Dict[int, asyncio.Task], key: int, task: asyncio.Ta
 
     task.add_done_callback(_cleanup)
 
+
+async def _maybe_trigger_mock_aggregation_for_attempt(attempt_id: int) -> None:
+    """
+    If this scenario attempt belongs to a mock exam, trigger mock aggregation
+    once all its scenario attempts reach terminal states.
+    """
+    attempt = await db.get_scenario_attempt(attempt_id)
+    if not attempt:
+        return
+
+    mock_exam_attempt_id = attempt.get("mock_exam_attempt_id")
+    if not mock_exam_attempt_id:
+        return
+
+    mock_attempt = await db.get_mock_exam_attempt(mock_exam_attempt_id)
+    if not mock_attempt:
+        print(f"[Background] Mock exam attempt {mock_exam_attempt_id} not found")
+        return
+
+    if mock_attempt["feedback_status"] == "completed":
+        return
+
+    active_task = _mock_tasks.get(mock_exam_attempt_id)
+    if active_task and not active_task.done():
+        return
+
+    scenario_attempts = await db.get_scenario_attempts_for_mock(mock_exam_attempt_id)
+    if not scenario_attempts:
+        return
+
+    statuses = [sa["feedback_status"] for sa in scenario_attempts]
+    if any(status in {"pending", "processing"} for status in statuses):
+        return
+
+    if any(status == "failed" for status in statuses):
+        if mock_attempt["feedback_status"] != "failed":
+            await db.update_mock_exam_attempt_status(mock_exam_attempt_id, "failed")
+        print(f"[Background] Mock exam {mock_exam_attempt_id} marked failed (one or more scenarios failed)")
+        return
+
+    task = asyncio.create_task(run_mock_exam_analysis_task(mock_exam_attempt_id))
+    _register_task(_mock_tasks, mock_exam_attempt_id, task)
+    print(f"[Background] Auto-triggered mock exam aggregation for {mock_exam_attempt_id}")
+
 # CORS middleware - configure as needed
 app.add_middleware(
     CORSMiddleware,
@@ -139,6 +183,11 @@ async def run_analysis_task(attempt_id: int):
         raise
     except Exception as e:
         print(f"[Background] Analysis failed for attempt {attempt_id}: {e}")
+    finally:
+        try:
+            await _maybe_trigger_mock_aggregation_for_attempt(attempt_id)
+        except Exception as e:
+            print(f"[Background] Mock aggregation check failed for attempt {attempt_id}: {e}")
 
 
 @app.get("/analyze/status/{attempt_id}", response_model=StatusResponse)
@@ -243,6 +292,11 @@ async def run_retry_task(attempt_id: int):
         raise
     except Exception as e:
         print(f"[Background] Retry failed for attempt {attempt_id}: {e}")
+    finally:
+        try:
+            await _maybe_trigger_mock_aggregation_for_attempt(attempt_id)
+        except Exception as e:
+            print(f"[Background] Mock aggregation check failed for retry {attempt_id}: {e}")
 
 
 @app.post("/analyze/full-video/{attempt_id}", response_model=AnalyzeResponse)
@@ -325,6 +379,11 @@ async def run_full_video_analysis_task(attempt_id: int, full_video_key: str):
         raise
     except Exception as e:
         print(f"[Background] Full video analysis failed for attempt {attempt_id}: {e}")
+    finally:
+        try:
+            await _maybe_trigger_mock_aggregation_for_attempt(attempt_id)
+        except Exception as e:
+            print(f"[Background] Mock aggregation check failed for full-video attempt {attempt_id}: {e}")
 
 
 @app.post("/analyze/full-video/{attempt_id}/sync")

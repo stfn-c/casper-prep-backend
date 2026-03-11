@@ -43,7 +43,7 @@ async def get_scenario_attempt(attempt_id: int) -> Optional[Dict[str, Any]]:
     row = await pool.fetchrow(
         """
         SELECT
-            sa.id, sa.user_id, sa.scenario_id, sa.session_id,
+            sa.id, sa.user_id, sa.scenario_id, sa.session_id, sa.mock_exam_attempt_id,
             sa.status, sa.feedback_status,
             sa.overall_quartile, sa.overall_scores, sa.overall_summary,
             sa.overall_strengths, sa.overall_improvements,
